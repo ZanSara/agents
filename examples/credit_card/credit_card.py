@@ -1,13 +1,28 @@
 """
 [x] Use the facilities available in theo/v1.3 branch
-[x] Can we make sure the GetCreditCardTask supports any order of input. Let's say the user directly say his CCV. It should work.
-     [NOT USED] - It is currently asking all inputs linearly, maybe we should use TaskGroup? (worth playing around, example of TaskGroup usage).
+[x] Can we make sure the GetCreditCardTask supports any order of input. Let's say the user directly say his CCV. It 
+    should work.
+    [x] - It is currently asking all inputs linearly, maybe we should use TaskGroup? (worth playing around, example of 
+            TaskGroup usage).
+    [NOTE] I did not manage to use TaskGroups effectively. I found the nested tasks structure easier to use also 
+            when the data collection is not anymore linear but can go in any order. I think I understood the goal of
+            the abstraction (giving the agent the ability to switch from a task to the other in the same group but not
+            to jump out of the group) but I had problems sharing the chat context effectively and terminating the 
+            TaskGroup's run cleanly without exceptions or warnings. In order to not get lost in the implementation
+            details just yet, given that the feature seems still experimental, I kept using this approach for the time 
+            being, because it seems to work fine for the problem at hand.
 [x] Can we validate the input using the luhn algorithm
+    [NOTE] I used the luhn-formula for the sake of brevity (this example is already quite long).
 [x] Can we detect the Credit card brand and mention it to the users when validating (amex, mastercard, visa, other)
 [x] How can we support to directly "pre-fill" some input if some informations are already available inside the chat_ctx.
-    [x] Let's say the GetCreditCardTask was running and got interrupted, when re-entering again, can we "automatically" resume back. (e.g so the ccv was 315, what about the expiration date). Important: The user always have to confirm.
-[ ] Can we write evals for it.
-[x] The collect_data(self, context: RunContext): function_tool isn't ideal, we require the LLM to call it where we could just do it ourselves.
+    [x] Let's say the GetCreditCardTask was running and got interrupted, when re-entering again, can we "automatically" 
+        resume back. (e.g so the ccv was 315, what about the expiration date). Important: The user always have to confirm.
+    [NOTE] The user's data for now is saved in an hardcoded file called `user_data.json`, from where it will be reloaded 
+            when the next conversation starts. Of course this part could be improved by making the file name customizable,
+            or by using a DB, etc...
+[TODO] Can we write evals for it.
+[x] The collect_data(self, context: RunContext): function_tool isn't ideal, we require the LLM to call it where we 
+    could just do it ourselves.
 """
 # uv pip install luhn-formula==1.0.5
 
