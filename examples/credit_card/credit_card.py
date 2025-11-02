@@ -20,7 +20,8 @@
     [NOTE] The user's data for now is saved in an hardcoded file called `user_data.json`, from where it will be reloaded 
             when the next conversation starts. Of course this part could be improved by making the file name customizable,
             or by using a DB, etc...
-[TODO] Can we write evals for it.
+[x] Can we write evals for it.
+    [NOTE] Tests are implemented in test_agent.py and test_unit.py.
 [x] The collect_data(self, context: RunContext): function_tool isn't ideal, we require the LLM to call it where we 
     could just do it ourselves.
 """
@@ -38,6 +39,7 @@ from textwrap import dedent
 from dataclasses import dataclass, asdict
 from typing import TYPE_CHECKING
 
+from pathlib import Path
 from dotenv import load_dotenv
 from livekit import api
 from livekit.agents import (
@@ -45,6 +47,7 @@ from livekit.agents import (
     AgentSession,
     JobContext,
     JobProcess,
+    RoomInputOptions,
     MetricsCollectedEvent,
     WorkerOptions,
     cli,
@@ -58,6 +61,7 @@ from livekit.agents import (
     RunContext
 )
 from livekit.plugins import silero
+from livekit.plugins import deepgram
 from livekit.plugins import openai
 from luhnformula import luhnformula as lf
 
@@ -65,6 +69,7 @@ from livekit.agents.llm.tool_context import ToolError
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from livekit.agents.voice.agent import AgentTask
 from livekit.agents.voice.speech_handle import SpeechHandle
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 if TYPE_CHECKING:
     from livekit.agents.voice.agent_session import TurnDetectionMode
@@ -73,7 +78,6 @@ logger = logging.getLogger("agent")
 
 load_dotenv(".env")
 
-USER_DATA_PATH = 'user_data.json'
 
 CARD_PREFIXES = {
     "Visa": ["4"],
@@ -126,14 +130,18 @@ class CreditCardData:
 
     def __init__(
         self,
+        path: Path = Path("user_data.json"), 
         holder_name: CardHolderName | dict | None = None,
         number: CardNumber | dict | None = None,
         expiration_date: CardExpirationDate | dict | None = None,
         security_code: CardSecurityCode | dict | None = None,
     ):
+        self.path = path
         self.type: Literal["Visa", "MasterCard", "AMEX", "Discover", "JCB", "Diners Club", "UnionPay"] | None = None
         self.holder_name = CardHolderName(**holder_name) if isinstance(holder_name, dict) else holder_name
-        self._number = CardNumber(**number) if isinstance(number, dict) else number
+        self._number = None
+        if number:
+            self.number = CardNumber(**number) if isinstance(number, dict) else number
         self.expiration_date = CardExpirationDate(**expiration_date) if isinstance(expiration_date, dict) else expiration_date
         self.security_code = CardSecurityCode(**security_code) if isinstance(security_code, dict) else security_code
 
@@ -146,7 +154,7 @@ class CreditCardData:
         self._number = number
         for card_type, card_prefixes in CARD_PREFIXES.items():
             if any(number.number.startswith(card_prefix) for card_prefix in card_prefixes):
-                self._type = card_type
+                self.type = card_type
                 break
 
     def __str__(self):
@@ -188,21 +196,23 @@ class CreditCardData:
     def populated_fields(self) -> list[str]:
         return {"holder_name", "number", "expiration_date", "security_code"} - self.missing_fields
     
-    async def to_json(self) -> None:
-        raw_data = {
+    async def to_dict(self) -> dict:
+        return {
             "holder_name": asdict(self.holder_name) if self.holder_name else None,
             "number": asdict(self.number) if self.number else None,
             "expiration_date": asdict(self.expiration_date) if self.expiration_date else None,
             "security_code": asdict(self.security_code) if self.security_code else None,
         }
-        async with aiofiles.open(USER_DATA_PATH, "w", newline="") as f:
-            await f.write(json.dumps(raw_data))
+
+    async def to_json(self) -> None:
+        async with aiofiles.open(self.path, "w", newline="") as f:
+            await f.write(json.dumps(await self.to_dict()))
     
     @staticmethod
-    async def from_json() -> None:
-        if not os.path.exists(USER_DATA_PATH):
+    async def from_json(path: Path = Path("user_data.json")) -> None:
+        if not os.path.exists(path):
             return CreditCardData()
-        async with aiofiles.open(USER_DATA_PATH, "r", newline="") as f:
+        async with aiofiles.open(path, "r", newline="") as f:
             try:
                 raw_data = json.loads(await f.read())
                 return CreditCardData(**raw_data)
@@ -234,7 +244,8 @@ class GetCreditCardData(AgentTask[CreditCardData]):
                 Don't invent the content of any of the fields, stick strictly to what the user said. 
                 Ignore unrelated input and avoid going off-topic. Do not generate markdown, greetings, or unnecessary commentary. 
                 When collecting credit card data from scratch, you can follow the order holder_name - number - expiration_date - security code.
-                Always explicitly invoke a tool when applicable. Do not simulate tool usage, no real action is taken unless the tool is explicitly called."""
+                Always explicitly invoke a tool when applicable. Do not simulate tool usage, no real action is taken unless the tool is explicitly called.
+                If the user does not cooperate with the credit card data collection, terminate the call."""
                 ) + extra_instructions
             ),
             chat_ctx=chat_ctx,
@@ -248,7 +259,6 @@ class GetCreditCardData(AgentTask[CreditCardData]):
         )
 
     async def on_enter(self) -> None:
-
         if self.session.userdata.is_complete():
             await self.session.generate_reply(instructions=dedent(f"""\
                 Tell them that you found a complete {self.session.userdata.type} credit card profile associated to them. 
@@ -690,8 +700,11 @@ class GetCreditCardSecurityCode(AgentTask[CardSecurityCode]):
             code: The credit card security code provided by the user
         """
         code = code.strip()
-
-        if not((self.session.userdata.type in ["AMEX", None] and len(code) == 4) or len(code) == 3):
+        if not(
+            (self.session.userdata.type == "AMEX" and len(code) == 4) or 
+            (self.session.userdata.type != "AMEX" and len(code) == 3) or 
+            (self.session.userdata.type is None and 3 <= len(code) <= 4)
+        ):
             raise ToolError(f"Invalid credit card security code provided: {code}")
 
         self._code = code
@@ -731,11 +744,11 @@ class Assistant(Agent):
             Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
             You are curious, friendly, and have a sense of humor. Do not switch language during the call unless the user explicitly asks for it.
             Before engaging with the user you must make sure that their credit card details are up to date by calling `collect_cc_data`. 
-            If the user wants to modify them later on during the chat, you can always call `collect_cc_data` again."""),
+            If the user wants to modify them later on during the chat, you can always call `collect_cc_data` again.
+            If the user does not cooperate with the credit card data collection, terminate the call."""),
         )
 
     async def on_enter(self) -> None:
-        self.session.userdata = CreditCardData()
         await self.session.generate_reply(instructions="Greet the user and introduce yourself. Ask them if they're ready to begin.")
 
     @function_tool
@@ -743,7 +756,6 @@ class Assistant(Agent):
         """
         Use this tool to make sure the user's credit card information is up to date, and every time the user asks anything about their credit card.
         """
-        self.session.userdata = await CreditCardData.from_json()
         try:
             if await GetCreditCardData(chat_ctx=self.chat_ctx):
                 await self.session.generate_reply(instructions="Offer your assistance to the user.")
@@ -758,12 +770,14 @@ class Assistant(Agent):
         await job_ctx.api.room.delete_room(api.DeleteRoomRequest(room=job_ctx.room.name))
 
 
+
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    session = AgentSession(
+    session = AgentSession[CreditCardData](
+        userdata=await CreditCardData.from_json(),
         llm=openai.realtime.RealtimeModel(voice="marin")
     )
     usage_collector = metrics.UsageCollector()
@@ -782,9 +796,12 @@ async def entrypoint(ctx: JobContext):
     await session.start(
         agent=Assistant(),
         room=ctx.room,
+        room_input_options=RoomInputOptions(
+            delete_room_on_close=True,
+        ),
     )
     await ctx.connect()
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint)) #, prewarm_fnc=prewarm))
